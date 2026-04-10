@@ -25,7 +25,6 @@ def check(label, passed, detail=""):
 print("\n── 1. Environment variables ─────────────────────────────")
 
 mongo_uri = os.environ.get("MONGO_URI", "")
-api_key   = os.environ.get("ANTHROPIC_API_KEY", "")
 mongo_db  = os.environ.get("MONGO_DB", "")
 
 check("MONGO_URI set",
@@ -40,14 +39,6 @@ check("MONGO_DB set",
       bool(mongo_db),
       f"Database name: {mongo_db}" if mongo_db else "MISSING — add MONGO_DB=pdi to .env")
 
-check("ANTHROPIC_API_KEY set",
-      bool(api_key),
-      f"Key starts with: {api_key[:20]}..." if api_key else "MISSING — add to .env")
-
-check("ANTHROPIC_API_KEY format valid",
-      api_key.startswith("sk-ant-"),
-      "Format looks correct" if api_key.startswith("sk-ant-") else "Expected sk-ant-... format")
-
 
 print("\n── 2. Python packages ───────────────────────────────────")
 
@@ -56,7 +47,11 @@ packages = [
     ("dnspython",     "dns"),
     ("flask",         "flask"),
     ("flask_cors",    "flask_cors"),
-    ("anthropic",     "anthropic"),
+    ("fastapi",       "fastapi"),
+    ("uvicorn",       "uvicorn"),
+    ("sklearn",       "sklearn"),
+    ("numpy",         "numpy"),
+    ("joblib",        "joblib"),
     ("dotenv",        "dotenv"),
 ]
 
@@ -118,29 +113,38 @@ except Exception as e:
         check("Atlas cluster reachable", False, f"{type(e).__name__}: {msg[:120]}")
 
 
-print("\n── 4. Anthropic API key validation ──────────────────────")
+print("\n── 4. Local neural network models ───────────────────────")
 
-try:
-    import anthropic
-    client = anthropic.Anthropic(api_key=api_key)
+import os as _os
+model_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "models")
+scaler_path     = _os.path.join(model_dir, "scaler.joblib")
+regressor_path  = _os.path.join(model_dir, "risk_regressor.joblib")
+classifier_path = _os.path.join(model_dir, "severity_classifier.joblib")
 
-    # Make a minimal test call
-    response = client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=10,
-        messages=[{"role": "user", "content": "Reply with just: OK"}],
-    )
-    reply = response.content[0].text.strip()
-    check("Claude API key valid", True, f"Test response: '{reply}'")
+models_exist = all(_os.path.exists(p) for p in (scaler_path, regressor_path, classifier_path))
 
-except anthropic.AuthenticationError:
-    check("Claude API key valid", False, "INVALID KEY — Check ANTHROPIC_API_KEY in .env")
-
-except anthropic.RateLimitError:
-    check("Claude API key valid", True, "Key is valid but rate limited — try again shortly")
-
-except Exception as e:
-    check("Claude API key valid", False, f"{type(e).__name__}: {str(e)[:120]}")
+if models_exist:
+    try:
+        import joblib
+        import numpy as np
+        scaler     = joblib.load(scaler_path)
+        regressor  = joblib.load(regressor_path)
+        classifier = joblib.load(classifier_path)
+        # Quick smoke-test: predict on a normal vital-signs vector
+        normal = [80, 15, 98, 37.0, 110, 70,   0, 0, 0, 0, 0, 0,   80, 15, 98, 37.0, 110, 70]
+        X = np.array([normal], dtype=np.float32)
+        X_s = scaler.transform(X)
+        risk = float(regressor.predict(X_s)[0])
+        sev  = int(classifier.predict(X_s)[0])
+        check("Neural network models loadable", True,
+              f"Smoke-test passed — risk_weight: {risk:.3f}, severity: {['low','moderate','high'][sev]}")
+    except Exception as e:
+        check("Neural network models loadable", False, f"{type(e).__name__}: {str(e)[:120]}")
+else:
+    check("Neural network models loadable", False,
+          "Model files not found — run: python train_model.py\n"
+          "       (or they will be auto-generated on first API call)")
+    results[-1] = True  # treat as warning, not a hard failure
 
 
 print("\n── 5. Seed data dry run ─────────────────────────────────")
@@ -176,7 +180,8 @@ all_ok = all(results)
 
 if all_ok:
     print(f"  {PASS}  All {total} checks passed — backend is ready")
-    print("     Run: python app.py\n")
+    print("     Flask  : python app.py")
+    print("     FastAPI: uvicorn main:app --reload\n")
 else:
     failed = total - passed
     print(f"  {FAIL}  {failed} of {total} checks failed — fix the issues above first\n")
