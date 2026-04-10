@@ -1,15 +1,26 @@
 """
-PDI NLP Layer — Claude-powered clinical note generation + risk analysis
-Uses UMLS (Unified Medical Language System) clinical terminology as the
-knowledge base for structured nursing note generation from raw vitals.
+PDI NLP Layer — Local neural network for risk scoring + UMLS template-based note generation
+
+Replaces the Anthropic/Claude API with a locally trained MLP neural network
+(see train_model.py) for offline, cost-free inference.  The network predicts:
+
+  • risk_weight  — continuous float 0.0–1.0   (MLPRegressor)
+  • severity     — low / moderate / high        (MLPClassifier)
+
+SOAP nursing notes are generated from UMLS-grounded clinical templates rather
+than a large language model, keeping the output deterministic and explainable.
+
+If the trained model artefacts are not yet present the module automatically
+runs training (train_model.py) on first import so the API is always usable.
 """
 
-import json, os
-import anthropic
-from anthropic import RateLimitError, APIError
-from dotenv import load_dotenv
-load_dotenv(override=True)
-client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+from __future__ import annotations
+
+import os
+
+import joblib
+import numpy as np
+from train_model import compute_risk_weight
 
 # ── UMLS concept clusters used for clinical language grounding ────────────────
 # These map vital sign deviations to standardised UMLS clinical descriptors
@@ -94,87 +105,280 @@ THRESHOLDS_NORMAL = {
     "dbp":  {"low": 60,   "high": 80,   "unit": "mmHg"},
 }
 
+VITAL_KEYS    = ["hr", "rr", "spo2", "temp", "sbp", "dbp"]
+SEVERITY_LABELS = ["low", "moderate", "high"]
 
-def _build_vital_context(vitals: dict, assessment: dict) -> str:
+# ── Model registry — lazy-loaded on first inference call ──────────────────────
+_MODEL_DIR  = os.path.join(os.path.dirname(__file__), "models")
+_scaler     = None
+_regressor  = None
+_classifier = None
+
+
+def _ensure_models() -> bool:
     """
-    Build a structured clinical context string from current vitals and
-    their assessment, grounded in UMLS terminology.
+    Lazy-load trained model artefacts.  If they do not exist, run the trainer
+    automatically so the API is always functional without a manual setup step.
+    Returns True when models are available.
     """
-    lines = []
+    global _scaler, _regressor, _classifier
+    if _scaler is not None:
+        return True
+
+    scaler_path     = os.path.join(_MODEL_DIR, "scaler.joblib")
+    regressor_path  = os.path.join(_MODEL_DIR, "risk_regressor.joblib")
+    classifier_path = os.path.join(_MODEL_DIR, "severity_classifier.joblib")
+
+    if not all(os.path.exists(p) for p in (scaler_path, regressor_path, classifier_path)):
+        print("[nlp] Model artefacts not found — running train_model.py …")
+        try:
+            from train_model import train_and_save  # noqa: PLC0415
+            train_and_save(output_dir=_MODEL_DIR)
+        except Exception as exc:
+            print(f"[nlp] Auto-training failed: {exc}")
+            return False
+
+    try:
+        _scaler     = joblib.load(scaler_path)
+        _regressor  = joblib.load(regressor_path)
+        _classifier = joblib.load(classifier_path)
+        print("[nlp] Neural network models loaded.")
+        return True
+    except Exception as exc:
+        print(f"[nlp] Failed to load models: {exc}")
+        return False
+
+
+def _extract_features(vitals: dict, assessment: dict) -> list:
+    """
+    Build the 18-element feature vector used by the neural network:
+      [current_values×6, slopes×6, projections×6]
+    Missing vitals are imputed with the midpoint of their normal range.
+    """
     vital_assessments = {v["vital"]: v for v in assessment.get("vitals", [])}
+    values, slopes, projections = [], [], []
 
-    for key, thresh in THRESHOLDS_NORMAL.items():
+    for key in VITAL_KEYS:
+        thresh = THRESHOLDS_NORMAL[key]
+        normal_mid = (thresh["low"] + thresh["high"]) / 2.0
+        readings = vitals.get(key, [])
+
+        if readings:
+            current = float(readings[-1])
+            va      = vital_assessments.get(key, {})
+            slope   = float(va.get("slope_per_hour", 0.0))
+            proj    = float(va.get("projected_value", current))
+        else:
+            current = normal_mid
+            slope   = 0.0
+            proj    = normal_mid
+
+        values.append(current)
+        slopes.append(slope)
+        projections.append(proj)
+
+    return values + slopes + projections
+
+
+def _nn_predict(vitals: dict, assessment: dict) -> tuple:
+    """
+    Run neural-network inference.
+    Returns (risk_weight: float, severity: str).
+    Falls back to rule-based scoring when models are unavailable.
+    """
+    if not _ensure_models():
+        return _fallback_risk(vitals, assessment)
+
+    features = _extract_features(vitals, assessment)
+    X = np.array([features], dtype=np.float32)
+    X_s = _scaler.transform(X)
+
+    risk_weight = float(np.clip(_regressor.predict(X_s)[0], 0.0, 1.0))
+    severity_idx = int(_classifier.predict(X_s)[0])
+    severity = SEVERITY_LABELS[min(severity_idx, 2)]
+    return risk_weight, severity
+
+
+def _fallback_risk(vitals: dict, assessment: dict) -> tuple:
+    """
+    Rule-based fallback when NN models are unavailable.
+    Uses compute_risk_weight from train_model (imported at module level).
+    """
+    features    = _extract_features(vitals, assessment)
+    values      = features[0:6]
+    slopes      = features[6:12]
+    projections = features[12:18]
+    risk_weight = compute_risk_weight(values, slopes, projections)
+    severity    = "low" if risk_weight < 0.2 else ("moderate" if risk_weight < 0.5 else "high")
+    return risk_weight, severity
+
+
+# ── Recommended actions ───────────────────────────────────────────────────────
+
+_RECOMMENDED_ACTIONS = {
+    "high": [
+        "Notify ICU physician STAT",
+        "Increase monitoring frequency to every 15 minutes",
+        "Draw blood cultures and urgent bloods",
+        "Prepare resuscitation equipment",
+        "Escalate via rapid-response protocol",
+    ],
+    "moderate": [
+        "Notify senior nurse and document concerns",
+        "Increase monitoring to every 30 minutes",
+        "Review recent nursing notes and medication chart",
+        "Prepare documentation for escalation if trend continues",
+    ],
+    "low": [
+        "Continue routine monitoring every 2 hours",
+        "Document observations in patient record",
+    ],
+}
+
+
+def _get_recommended_actions(severity: str, flagged_terms: list) -> list:
+    actions = list(_RECOMMENDED_ACTIONS.get(severity, _RECOMMENDED_ACTIONS["low"]))
+    if "hypotensive" in flagged_terms or "decreased systolic pressure" in flagged_terms:
+        actions.insert(0, "Assess fluid status — consider IV fluid challenge per protocol")
+    if "hypoxaemic" in flagged_terms or "desaturating" in flagged_terms:
+        actions.insert(0, "Apply supplemental oxygen and assess airway patency")
+    return actions
+
+
+def _build_reasoning(flagged_terms: list, severity: str, pdi_score) -> str:
+    severity_map = {
+        "low":      "is stable and within acceptable parameters",
+        "moderate": "warrants increased monitoring and senior nurse review",
+        "high":     "indicates high risk of imminent deterioration requiring immediate escalation",
+    }
+    if not flagged_terms:
+        return (f"All vital signs are within normal limits; PDI score {pdi_score}/100 "
+                f"indicates a clinically stable condition.")
+    terms_str = ", ".join(flagged_terms[:3])
+    return (f"Presence of {terms_str} with PDI score {pdi_score}/100 "
+            f"{severity_map.get(severity, 'requires clinical review')}.")
+
+
+# ── SOAP note template builder ────────────────────────────────────────────────
+
+def _build_soap_note(
+    vitals: dict,
+    assessment: dict,
+    patient_meta: dict,
+    risk_weight: float,
+    severity: str,
+) -> dict:
+    """
+    Construct a structured SOAP nursing note using UMLS-aligned clinical
+    templates.  All clinical terminology is grounded in UMLS concept codes.
+    """
+    vital_assessments = {v["vital"]: v for v in assessment.get("vitals", [])}
+    pdi               = assessment.get("pdi", {})
+    pdi_score         = pdi.get("score", "N/A")
+
+    name      = patient_meta.get("name", "Patient")
+    age       = patient_meta.get("age", "N/A")
+    ward      = patient_meta.get("ward", "ICU")
+    bed       = patient_meta.get("bed", "N/A")
+    diagnosis = patient_meta.get("diagnosis", "under observation")
+
+    flagged_terms: list[str] = []
+    abnormal_lines: list[str] = []
+    normal_lines:   list[str] = []
+
+    for key in VITAL_KEYS:
         readings = vitals.get(key, [])
         if not readings:
             continue
 
-        current = readings[-1]
+        thresh  = THRESHOLDS_NORMAL[key]
         va      = vital_assessments.get(key, {})
+        current = readings[-1]
         slope   = va.get("slope_per_hour", 0)
         proj    = va.get("projected_value", current)
-        risk    = va.get("worst_risk", "ok")
 
-        direction = None
         if current > thresh["high"]:
             direction = "high"
         elif current < thresh["low"]:
             direction = "low"
+        else:
+            direction = None
 
-        umls = UMLS_CONCEPTS = UMLS_VITAL_CONCEPTS.get(key, {})
-        concept = umls.get(direction, {}) if direction else {}
-        descriptor = concept.get("descriptors", [None])[0]
-        concern    = concept.get("clinical_concern", "")
+        if direction:
+            concepts   = UMLS_VITAL_CONCEPTS.get(key, {}).get(direction, {})
+            descriptor = concepts.get("descriptors", [key])[0]
+            concern    = concepts.get("clinical_concern", "")
+            umls_code  = concepts.get("umls_concept", "")
 
-        status = f"{descriptor} ({current} {thresh['unit']})" if descriptor else f"within normal range ({current} {thresh['unit']})"
-        trend  = f"trending {'up' if slope > 0 else 'down'} at {abs(slope):.1f} {thresh['unit']}/hr, projected {proj} {thresh['unit']} in 4h"
+            trend = ("worsening"
+                     if (direction == "high" and slope > 0) or (direction == "low" and slope < 0)
+                     else "stable")
 
-        line = f"- {key.upper()}: {status}; {trend}"
-        if concern and risk != "ok":
-            line += f"; concern: {concern}"
-        lines.append(line)
+            line = (f"{key.upper()} {current} {thresh['unit']} — {descriptor} "
+                    f"[UMLS:{umls_code}], trend: {trend}; "
+                    f"projected {proj} {thresh['unit']} in 4 h")
+            if concern:
+                line += f"; concern: {concern}"
 
-    return "\n".join(lines)
+            flagged_terms.append(descriptor)
+            abnormal_lines.append(line)
+        else:
+            normal_lines.append(
+                f"{key.upper()} {current} {thresh['unit']} — within normal limits; "
+                f"projected {proj} {thresh['unit']} in 4 h"
+            )
 
+    # ── S ─────────────────────────────────────────────────────────────────────
+    s_section = (
+        f"S: {name}, {age} years old, admitted to {ward} (Bed {bed}) "
+        f"for {diagnosis}. Nursing assessment performed."
+    )
 
-SYSTEM_PROMPT = """You are an expert ICU nursing documentation assistant.
-Your role is to generate structured, professional nursing observation notes using
-standardised clinical terminology grounded in the Unified Medical Language System (UMLS).
+    # ── O ─────────────────────────────────────────────────────────────────────
+    o_lines = ["O: Current vital signs with 4-hour trend analysis:"]
+    for line in abnormal_lines + normal_lines:
+        o_lines.append(f"   {line}")
+    o_lines.append(
+        f"   PDI Risk Score: {pdi_score}/100 "
+        f"({pdi.get('risk_level', 'ok').upper()}) — "
+        f"neural network risk weight: {risk_weight:.2f}"
+    )
+    o_section = "\n".join(o_lines)
 
-You will receive a patient's current vital signs with trend analysis and produce:
-1. A structured SOAP-style nursing note
-2. A risk weight (0.0–1.0) based on the clinical picture
-3. Flagged clinical concerns using UMLS-aligned terminology
+    # ── A ─────────────────────────────────────────────────────────────────────
+    severity_desc = {
+        "low":      "low clinical risk; patient is haemodynamically stable",
+        "moderate": "moderate risk of physiological deterioration",
+        "high":     "high risk of imminent deterioration",
+    }
+    a_section = f"A: Patient assessment indicates {severity_desc.get(severity, severity)}. "
+    if flagged_terms:
+        a_section += f"Clinical concerns identified: {', '.join(flagged_terms)}."
+    else:
+        a_section += "No significant clinical concerns identified at this time."
 
-IMPORTANT RULES:
-- Use precise UMLS-aligned clinical language (e.g. "tachycardic" not "fast heartbeat")
-- Focus on DETERIORATION risk — do NOT diagnose or use disease-specific terms like "sepsis"
-- Note both current values AND the 4-hour trajectory
-- Be concise — this is a bedside note, not a discharge summary
-- Always note which vitals are within normal limits
+    # ── P ─────────────────────────────────────────────────────────────────────
+    actions = _get_recommended_actions(severity, flagged_terms)
+    p_section = "P: " + "; ".join(actions[:4]) + "."
 
-You must respond ONLY with valid JSON — no preamble, no markdown fences.
+    soap_note = "\n\n".join([s_section, o_section, a_section, p_section])
+    reasoning = _build_reasoning(flagged_terms, severity, pdi_score)
 
-Response structure:
-{
-  "generated_note": "Full SOAP nursing note as a string",
-  "flagged_terms": ["UMLS-aligned clinical concern phrases"],
-  "risk_weight": 0.0,
-  "severity": "low | moderate | high",
-  "reasoning": "One sentence clinical summary using UMLS terminology.",
-  "recommended_actions": ["action 1", "action 2"]
-}
-
-Risk weight scale:
-- 0.0–0.2: All vitals stable, no concerning trends
-- 0.2–0.5: One or more vitals trending toward abnormal range
-- 0.5–0.75: Multiple abnormal vitals with adverse trajectory
-- 0.75–1.0: Imminent deterioration risk — immediate escalation required"""
+    return {
+        "generated_note":      soap_note,
+        "flagged_terms":       flagged_terms,
+        "risk_weight":         round(risk_weight, 4),
+        "severity":            severity,
+        "reasoning":           reasoning,
+        "recommended_actions": actions,
+    }
 
 
 def generate_nursing_note(vitals: dict, assessment: dict, patient_meta: dict) -> dict:
     """
-    Generate a UMLS-grounded nursing note from patient vitals and assessment.
-    Returns structured note with risk analysis.
+    Generate a UMLS-grounded SOAP nursing note using the local neural network
+    for risk scoring and clinical templates for text generation.
+    No external API calls are made.
     """
     if not vitals or not any(v for v in vitals.values()):
         return {
@@ -186,135 +390,25 @@ def generate_nursing_note(vitals: dict, assessment: dict, patient_meta: dict) ->
             "recommended_actions": [],
         }
 
-    vital_context = _build_vital_context(vitals, assessment)
-    pdi_score     = assessment.get("pdi", {}).get("score", "N/A")
-    risk_level    = assessment.get("pdi", {}).get("risk_level", "ok")
-
-    prompt = f"""Generate a nursing observation note for this ICU patient.
-
-Patient: {patient_meta.get('name', 'Unknown')}, Age: {patient_meta.get('age', 'N/A')}, Weight: {patient_meta.get('weight', 'N/A')}
-Ward: {patient_meta.get('ward', 'ICU')}, Bed: {patient_meta.get('bed', 'N/A')}
-PDI Risk Score: {pdi_score}/100 ({risk_level.upper()})
-
-Current Vital Signs with 4-hour Trend Analysis:
-{vital_context}
-
-Generate a professional SOAP-format nursing note using UMLS-aligned clinical terminology.
-Focus on deterioration risk — note trends and trajectories, not just current values."""
-
     try:
-        response = client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=800,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}],
-        )
-
-        # Handle different response structures
-        if isinstance(response, str):
-            raw = response.strip()
-        elif hasattr(response, 'content') and response.content:
-            raw = response.content[0].text.strip()
-        else:
-            raise ValueError(f"Unexpected response structure: {type(response)}")
-
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-
-        result = json.loads(raw)
-        result["risk_weight"] = max(0.0, min(1.0, float(result.get("risk_weight", 0.0))))
-        return result
-
-    except RateLimitError:
-        return {
-            "generated_note": "Rate limit exceeded — please try again in a moment.",
-            "flagged_terms": [],
-            "risk_weight": 0.0,
-            "severity": "low",
-            "reasoning": "API rate limit hit. Free tier has strict quotas.",
-            "recommended_actions": ["Retry in 60 seconds"],
-            "error": True,
-            "rate_limited": True,
-        }
-    except APIError as e:
-        return {
-            "generated_note": "API error — service temporarily unavailable.",
-            "flagged_terms": [],
-            "risk_weight": 0.0,
-            "severity": "low",
-            "reasoning": f"API error: {str(e)}",
-            "recommended_actions": ["Check API key and quota"],
-            "error": True,
-        }
-    except json.JSONDecodeError:
+        risk_weight, severity = _nn_predict(vitals, assessment)
+        return _build_soap_note(vitals, assessment, patient_meta, risk_weight, severity)
+    except Exception:
         return {
             "generated_note": "Note generation failed — manual documentation required.",
             "flagged_terms": [],
-            "risk_weight": 0.3,
-            "severity": "moderate",
-            "reasoning": "Unable to parse AI response. Clinical review recommended.",
-            "recommended_actions": ["Manual clinical review required"],
-            "parse_error": True,
-        }
-    except Exception as e:
-        return {
-            "generated_note": "",
-            "flagged_terms": [],
             "risk_weight": 0.0,
             "severity": "low",
-            "reasoning": f"Note generation unavailable: {type(e).__name__}: {str(e)}",
-            "recommended_actions": [],
+            "reasoning": "Automated note generation encountered an internal error. Clinical review required.",
+            "recommended_actions": ["Manual clinical review required"],
             "error": True,
         }
 
-# def generate_nursing_note(vitals_context: str) -> dict:
-#     """
-#     Ask Claude to write a nursing note from current vitals,
-#     then assess it for risk markers in one shot.
-#     """
-#     prompt = f"""Given these neonatal patient vitals: {vitals_context}
-
-# Write a concise nursing observation note (2-3 sentences) in clinical language,
-# then analyse it for risk markers.
-
-# Respond ONLY with valid JSON:
-# {{
-#   "generated_note": "the nursing note text",
-#   "flagged_terms": [],
-#   "risk_weight": 0.0,
-#   "severity": "low | moderate | high",
-#   "reasoning": "one sentence",
-#   "recommended_actions": []
-# }}"""
-
-#     try:
-#         response = client.messages.create(
-#             model="claude-sonnet-4-5",
-#             max_tokens=512,
-#             messages=[{"role": "user", "content": prompt}],
-#         )
-#         raw = response.content[0].text.strip()
-#         if raw.startswith("```"):
-#             raw = raw.split("```")[1]
-#             if raw.startswith("json"):
-#                 raw = raw[4:]
-#         result = json.loads(raw)
-#         result["risk_weight"] = max(0.0, min(1.0, float(result.get("risk_weight", 0.0))))
-#         return result
-#     except Exception as e:
-#         return {
-#             "generated_note": "Note generation failed — check backend.",
-#             "flagged_terms": [], "risk_weight": 0.0,
-#             "severity": "low", "reasoning": str(e),
-#             "recommended_actions": [], "error": True,
-#         }
 
 def analyze_nursing_note(note: str) -> dict:
     """
-    Analyze a manually entered nursing note for clinical risk markers.
-    Uses UMLS-grounded terminology for flag detection.
+    Analyse a manually entered nursing note for clinical risk markers using
+    UMLS-aligned keyword matching.  No external API calls are made.
     """
     if not note or not note.strip():
         return {
@@ -326,72 +420,70 @@ def analyze_nursing_note(note: str) -> dict:
             "recommended_actions": [],
         }
 
-    try:
-        response = client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=512,
-            system=SYSTEM_PROMPT,
-            messages=[{
-                "role": "user",
-                "content": f"Analyse this nursing observation note for deterioration risk using UMLS clinical terminology:\n\n\"{note.strip()}\""
-            }],
-        )
+    # Ordered by clinical severity weight — longer phrases matched first to
+    # avoid partial-match issues (e.g. "decreased systolic" before "systolic").
+    TERM_WEIGHTS: dict[str, float] = {
+        # Oxygenation — highest weight
+        "hypoxaemic": 0.18, "hypoxemic": 0.18,
+        "desaturating": 0.18, "desaturation": 0.18,
+        "decreased oxygen saturation": 0.18,
+        # Haemodynamic compromise
+        "hypotensive": 0.16, "hypotension": 0.16,
+        "decreased systolic pressure": 0.14,
+        # General deterioration markers
+        "deteriorating": 0.20, "deterioration": 0.20,
+        "imminent": 0.20, "escalation": 0.15,
+        "critical": 0.20, "emergent": 0.20,
+        "unstable": 0.18, "worsening": 0.15, "urgent": 0.14,
+        # Cardiac
+        "tachycardic": 0.14, "tachycardia": 0.14,
+        "elevated heart rate": 0.14, "increased pulse rate": 0.14,
+        "bradycardic": 0.14, "bradycardia": 0.14,
+        "decreased heart rate": 0.14, "slow pulse": 0.14,
+        # Respiratory
+        "tachypnoeic": 0.12, "tachypneic": 0.12,
+        "increased respiratory rate": 0.12,
+        "bradypnoeic": 0.12, "bradypneic": 0.12,
+        # Temperature
+        "febrile": 0.10, "pyrexial": 0.10, "pyrexia": 0.10,
+        "elevated temperature": 0.10,
+        "hypothermic": 0.10, "hypothermia": 0.10,
+        # Blood pressure (hypertensive side — lower weight)
+        "hypertensive": 0.09, "hypertension": 0.09,
+        "elevated systolic": 0.09,
+    }
 
-        # Handle different response structures
-        if isinstance(response, str):
-            raw = response.strip()
-        elif hasattr(response, 'content') and response.content:
-            raw = response.content[0].text.strip()
-        else:
-            raise ValueError(f"Unexpected response structure: {type(response)}")
+    note_lower = note.lower()
+    flagged_terms: list[str] = []
+    risk_score = 0.0
 
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
+    # TERM_WEIGHTS keys are unique so each term is matched at most once.
+    for term, weight in TERM_WEIGHTS.items():
+        if term in note_lower:
+            flagged_terms.append(term)
+            risk_score = min(1.0, risk_score + weight)
 
-        result = json.loads(raw)
-        result["risk_weight"] = max(0.0, min(1.0, float(result.get("risk_weight", 0.0))))
-        return result
+    risk_weight = min(1.0, risk_score)
+    severity = "low" if risk_weight < 0.2 else ("moderate" if risk_weight < 0.5 else "high")
+    actions   = _get_recommended_actions(severity, flagged_terms)
 
-    except RateLimitError:
-        return {
-            "generated_note": "Rate limit exceeded — please try again.",
-            "flagged_terms": [],
-            "risk_weight": 0.0,
-            "severity": "low",
-            "reasoning": "API rate limit hit. Free tier has strict quotas.",
-            "recommended_actions": ["Retry in 60 seconds"],
-            "error": True,
-            "rate_limited": True,
+    if not flagged_terms:
+        reasoning = "No UMLS-aligned clinical risk markers detected in the nursing note."
+    else:
+        terms_str = ", ".join(flagged_terms[:3])
+        severity_map = {
+            "low":      "requires routine monitoring",
+            "moderate": "warrants increased monitoring and senior nurse review",
+            "high":     "indicates elevated deterioration risk requiring immediate clinical review",
         }
-    except APIError as e:
-        return {
-            "generated_note": "API error — service temporarily unavailable.",
-            "flagged_terms": [],
-            "risk_weight": 0.0,
-            "severity": "low",
-            "reasoning": f"API error: {str(e)}",
-            "recommended_actions": ["Check API key and quota"],
-            "error": True,
-        }
-    except json.JSONDecodeError:
-        return {
-            "generated_note": "Analysis failed — unable to parse response.",
-            "flagged_terms": [],
-            "risk_weight": 0.0,
-            "severity": "low",
-            "reasoning": "Unable to parse AI response.",
-            "recommended_actions": ["Manual review required"],
-            "error": True,
-        }
-    except Exception as e:
-        return {
-            "generated_note": "",
-            "flagged_terms": [],
-            "risk_weight": 0.0,
-            "severity": "low",
-            "reasoning": f"Analysis unavailable: {type(e).__name__}: {str(e)}",
-            "recommended_actions": [],
-            "error": True,
-        }
+        reasoning = (f"Detected clinical markers: {terms_str}. "
+                     f"Risk level {severity_map.get(severity, 'requires clinical review')}.")
+
+    return {
+        "generated_note":      note.strip(),
+        "flagged_terms":       flagged_terms,
+        "risk_weight":         round(risk_weight, 4),
+        "severity":            severity,
+        "reasoning":           reasoning,
+        "recommended_actions": actions,
+    }
