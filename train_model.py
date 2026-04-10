@@ -53,7 +53,8 @@ CLINICAL_SPANS = {
     "dbp":  {"high": 30,  "low": 25},   # 80→110; 60→35
 }
 
-# PDI composite weights (fractional; must sum to 1.0 — mirrors the 100-point scale in engine.py)
+# PDI composite weights as fractions (spo2=0.25 → 25 of 100 points, etc.)
+# These mirror engine.py's PDI_WEIGHTS = {"spo2": 25, "hr": 20, ...} normalised to sum to 1.0.
 PDI_WEIGHTS = {"spo2": 0.25, "hr": 0.20, "sbp": 0.18, "dbp": 0.12, "temp": 0.15, "rr": 0.10}
 
 VITAL_KEYS = ["hr", "rr", "spo2", "temp", "sbp", "dbp"]

@@ -141,10 +141,10 @@ if models_exist:
     except Exception as e:
         check("Neural network models loadable", False, f"{type(e).__name__}: {str(e)[:120]}")
 else:
-    check("Neural network models loadable", False,
-          "Model files not found — run: python train_model.py\n"
-          "       (or they will be auto-generated on first API call)")
-    results[-1] = True  # treat as warning, not a hard failure
+    # Models not yet trained — not a hard failure; they auto-generate on first API call.
+    print(f"  {WARN}  Neural network models not found")
+    print("       Run: python train_model.py  (auto-generated on first API call)")
+    results.append(True)  # record as passed — this is a warning, not a blocking error
 
 
 print("\n── 5. Seed data dry run ─────────────────────────────────")

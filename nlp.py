@@ -14,10 +14,13 @@ If the trained model artefacts are not yet present the module automatically
 runs training (train_model.py) on first import so the API is always usable.
 """
 
+from __future__ import annotations
+
 import os
 
 import joblib
 import numpy as np
+from train_model import compute_risk_weight
 
 # ── UMLS concept clusters used for clinical language grounding ────────────────
 # These map vital sign deviations to standardised UMLS clinical descriptors
@@ -199,15 +202,14 @@ def _nn_predict(vitals: dict, assessment: dict) -> tuple:
 def _fallback_risk(vitals: dict, assessment: dict) -> tuple:
     """
     Rule-based fallback when NN models are unavailable.
-    Mirrors the deviation logic from train_model.py.
+    Uses compute_risk_weight from train_model (imported at module level).
     """
-    from train_model import compute_risk_weight  # noqa: PLC0415
-    features = _extract_features(vitals, assessment)
+    features    = _extract_features(vitals, assessment)
     values      = features[0:6]
     slopes      = features[6:12]
     projections = features[12:18]
     risk_weight = compute_risk_weight(values, slopes, projections)
-    severity = "low" if risk_weight < 0.2 else ("moderate" if risk_weight < 0.5 else "high")
+    severity    = "low" if risk_weight < 0.2 else ("moderate" if risk_weight < 0.5 else "high")
     return risk_weight, severity
 
 
