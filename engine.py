@@ -83,11 +83,42 @@ RiskLevel = Literal["ok", "warn", "crit"]
 
 
 # ── Linear regression ─────────────────────────────────────────────────────────
+#
+# Why linear regression for vital signs?
+#
+# ICU vital signs (HR, SpO2, RR, BP, Temp) are recorded at fixed intervals
+# (typically every 2 hours).  Over a short observation window (e.g. 6–8 hours)
+# physiological deterioration is well-approximated by a straight-line trend:
+# a patient does not suddenly flip from stable to critical — they drift.
+#
+# Linear regression over the recent readings gives us three clinically useful
+# numbers with zero external dependencies:
+#
+#   • slope     — the rate of change per reading interval (e.g. HR rising by
+#                 3 bpm per 2-hour check = tachycardic drift).
+#   • intercept — the fitted baseline, used to project future values.
+#   • R²        — goodness-of-fit (0–1).  A high R² means the trend is
+#                 consistent and the projection is trustworthy; a low R²
+#                 (noisy readings with no clear direction) keeps the system
+#                 from raising false alarms on random fluctuations.
+#
+# These outputs feed directly into `project_vital()` which extrapolates the
+# trend 4 hours ahead, and from there into the PDI composite score and the
+# pre-emptive alert system.  The goal is to flag a patient who *will* be
+# critical in 4 hours, not just one who already is.
 
 def linear_regression(values: list[float]) -> dict:
     """
-    Fit a line to a series of evenly-spaced readings.
-    Returns slope, intercept, and R² goodness-of-fit.
+    Fit a least-squares line to a series of evenly-spaced readings.
+
+    Each element in *values* is treated as a reading taken one interval apart
+    (index 0, 1, 2 …).  The actual wall-clock spacing (e.g. 2 hours) is
+    applied later in ``project_vital``.
+
+    Returns:
+        slope     – change in value per reading index step
+        intercept – y-intercept of the fitted line
+        r2        – Pearson R² (coefficient of determination, 0–1)
     """
     n = len(values)
     if n < 2:
@@ -110,9 +141,23 @@ def linear_regression(values: list[float]) -> dict:
 
 def project_vital(readings: list[float], hours_ahead: float = 4.0) -> dict:
     """
-    Project a vital sign forward by `hours_ahead`.
-    Readings are assumed to be 2-hourly (adjust interval_hours if different).
-    Returns slope per hour, projected value, and confidence (R²).
+    Project a vital sign forward by *hours_ahead* using the linear trend
+    fitted to *readings*.
+
+    Readings are assumed to be taken every ``interval_hours`` hours (default
+    2 h, matching standard ICU observation frequency).  The function converts
+    the per-index slope into a per-hour slope so that the caller always works
+    in clinically meaningful units.
+
+    Args:
+        readings:    Chronological list of recent measurements (oldest first).
+        hours_ahead: How far into the future to project (default 4 h).
+
+    Returns:
+        slope_per_hour  – rate of change in value per hour (positive = rising)
+        projected_value – extrapolated value *hours_ahead* from now
+        r2              – R² from the underlying linear fit (confidence proxy)
+        hours_ahead     – echoed back for the caller's convenience
     """
     interval_hours = 2.0
     reg = linear_regression(readings)
